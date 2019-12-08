@@ -77,6 +77,9 @@
 #define ESR_TIMER_CHG_INIT_OFFSET	2
 #define ESR_EXTRACTION_ENABLE_WORD	19
 #define ESR_EXTRACTION_ENABLE_OFFSET	0
+#define SAT_CC_CLR_VCTIBTRSLWEN_WORD    19
+#define SAT_CC_CLR_OFFSET               0
+#define VCTIBTRSLWEN_OFFSET             1
 #define PROFILE_LOAD_WORD		24
 #define PROFILE_LOAD_OFFSET		0
 #define ESR_RSLOW_DISCHG_WORD		34
@@ -87,6 +90,8 @@
 #define NOM_CAP_OFFSET			0
 #define ACT_BATT_CAP_BKUP_WORD		74
 #define ACT_BATT_CAP_BKUP_OFFSET	0
+#define PROFILE_REVISION_WORD		74
+#define PROFILE_REVISION_OFFSET		3
 #define CYCLE_COUNT_WORD		75
 #define CYCLE_COUNT_OFFSET		0
 #define PROFILE_INTEGRITY_WORD		79
@@ -910,6 +915,89 @@ out:
 	return rc;
 }
 
+static const char *fg_get_mmi_battid(void)
+{
+	struct device_node *np = of_find_node_by_path("/chosen");
+	const char *battsn_buf;
+	int retval;
+
+	battsn_buf = NULL;
+
+	if (np)
+		retval = of_property_read_string(np, "mmi,battid",
+						 &battsn_buf);
+	else
+		return NULL;
+
+	if ((retval == -EINVAL) || !battsn_buf) {
+		pr_err("Battsn unused\n");
+		of_node_put(np);
+		return NULL;
+
+	} else
+		pr_err("Battsn = %s\n", battsn_buf);
+
+	of_node_put(np);
+
+	return battsn_buf;
+}
+
+static struct device_node *fg_get_serialnumber(struct fg_chip *chip,
+					       struct device_node *np)
+{
+	struct device_node *node, *df_node, *sn_node;
+	const char *sn_buf, *df_sn, *dev_sn;
+	int rc;
+
+	if (!np)
+		return NULL;
+
+	dev_sn = NULL;
+	df_sn = NULL;
+	sn_buf = NULL;
+	df_node = NULL;
+	sn_node = NULL;
+
+	dev_sn = fg_get_mmi_battid();
+
+	rc = of_property_read_string(np, "df-serialnum",
+				     &df_sn);
+	if (rc)
+		dev_warn(chip->dev, "No Default Serial Number defined");
+	else if (df_sn)
+		dev_warn(chip->dev, "Default Serial Number %s", df_sn);
+
+	for_each_child_of_node(np, node) {
+		rc = of_property_read_string(node, "serialnum",
+					     &sn_buf);
+		if (!rc && sn_buf) {
+			if (dev_sn)
+				if (strnstr(dev_sn, sn_buf, 32))
+					sn_node = node;
+			if (df_sn)
+				if (strnstr(df_sn, sn_buf, 32))
+					df_node = node;
+		}
+	}
+
+	if (sn_node) {
+		node = sn_node;
+		df_node = NULL;
+		dev_warn(chip->dev, "Battery Match Found using %s",
+			 sn_node->name);
+	} else if (df_node) {
+		node = df_node;
+		sn_node = NULL;
+		dev_warn(chip->dev, "Battery Match Found using default %s",
+			 df_node->name);
+	} else {
+		dev_warn(chip->dev, "No Battery Match Found!");
+		return NULL;
+	}
+
+	return node;
+}
+
 static int fg_get_batt_profile(struct fg_chip *chip)
 {
 	struct device_node *node = chip->dev->of_node;
@@ -923,15 +1011,24 @@ static int fg_get_batt_profile(struct fg_chip *chip)
 		return -ENXIO;
 	}
 
-	profile_node = of_batterydata_get_best_profile(batt_node,
-				chip->batt_id_ohms / 1000, NULL);
-	if (IS_ERR(profile_node))
-		return PTR_ERR(profile_node);
+	profile_node = fg_get_serialnumber(chip, batt_node);
+
+	if (!profile_node) {
+		profile_node = of_batterydata_get_best_profile(batt_node,
+					chip->batt_id_ohms / 1000, NULL);
+		if (IS_ERR(profile_node))
+			return PTR_ERR(profile_node);
+	}
 
 	if (!profile_node) {
 		pr_err("couldn't find profile handle\n");
 		return -ENODATA;
 	}
+
+	rc = of_property_read_u8(profile_node, "qcom,profile-revision",
+			&chip->bp.profile_revision);
+	if (rc < 0)
+		pr_debug("battery profile revision not specified\n");
 
 	rc = of_property_read_string(profile_node, "qcom,battery-type",
 			&chip->bp.batt_type_str);
@@ -959,6 +1056,35 @@ static int fg_get_batt_profile(struct fg_chip *chip)
 	if (rc < 0) {
 		pr_err("battery cc_cv threshold unavailable, rc:%d\n", rc);
 		chip->bp.vbatt_full_mv = -EINVAL;
+	}
+
+	/*
+	 *parse thermal coefficience value from battery profile
+	 *for one project multi NTC
+	*/
+	if (of_property_count_elems_of_size(profile_node,
+		"qcom,battery-thermal-coeff",
+		sizeof(u8)) == BATT_THERM_NUM_COEFFS) {
+		rc = of_property_read_u8_array(profile_node,
+				"qcom,battery-thermal-coeff",
+				chip->dt.batt_therm_coeffs,
+				BATT_THERM_NUM_COEFFS);
+		if (rc < 0)
+			pr_warn("Error reading battery thermal coeff, rc:%d\n",
+				rc);
+		/*
+		 * configure battery thermal coefficients c1,c2,c3
+		 * if its value is not zero.
+		 */
+		if (chip->dt.batt_therm_coeffs[0] > 0) {
+			rc = fg_write(chip, BATT_INFO_THERM_C1(chip),
+				chip->dt.batt_therm_coeffs,
+				BATT_THERM_NUM_COEFFS);
+			if (rc < 0) {
+				pr_err("Error in writing battery thermal coeff, rc=%d\n",
+					rc);
+			}
+		}
 	}
 
 	data = of_get_property(profile_node, "qcom,fg-profile-data", &len);
@@ -1238,6 +1364,9 @@ static int fg_save_learned_cap_to_sram(struct fg_chip *chip)
 		return rc;
 	}
 
+	if (!chip->dt.cl_feedback)
+		goto cl_fb_bms_exit;
+
 	/* Write to actual capacity register for coulomb counter operation */
 	rc = fg_sram_write(chip, ACT_BATT_CAP_WORD, ACT_BATT_CAP_OFFSET,
 			(u8 *)&cc_mah, chip->sp[FG_SRAM_ACT_BATT_CAP].len,
@@ -1247,6 +1376,7 @@ static int fg_save_learned_cap_to_sram(struct fg_chip *chip)
 		return rc;
 	}
 
+cl_fb_bms_exit:
 	fg_dbg(chip, FG_CAP_LEARN, "learned capacity %llduah/%dmah stored\n",
 		chip->cl.learned_cc_uah, cc_mah);
 	return 0;
@@ -2503,10 +2633,30 @@ out:
 	pm_relax(chip->dev);
 }
 
+#define SAT_CC_CLR_AUTO_BIT BIT(3)
+#define VCTIBTRSLWEN_MASK   GENMASK(7, 6)
 static int fg_bp_params_config(struct fg_chip *chip)
 {
 	int rc = 0;
 	u8 buf;
+
+	/* Set CC_SOC saturation auto-clear */
+	rc = fg_sram_masked_write(chip, SAT_CC_CLR_VCTIBTRSLWEN_WORD,
+				SAT_CC_CLR_OFFSET, SAT_CC_CLR_AUTO_BIT,
+				SAT_CC_CLR_AUTO_BIT, FG_IMA_DEFAULT);
+	if (rc < 0) {
+		pr_err("failed to write SAT_CC_CLR rc=%d\n", rc);
+		return rc;
+	}
+
+	/* Set vCutOff, iBtRSlw */
+	rc = fg_sram_masked_write(chip, SAT_CC_CLR_VCTIBTRSLWEN_WORD,
+				VCTIBTRSLWEN_OFFSET, VCTIBTRSLWEN_MASK,
+				VCTIBTRSLWEN_MASK, FG_IMA_DEFAULT);
+	if (rc < 0) {
+		pr_err("failed to write VCTIBTRSLWEN rc=%d\n", rc);
+		return rc;
+	}
 
 	/* This SRAM register is only present in v2.0 and above */
 	if (!(chip->wa_flags & PMI8998_V1_REV_WA) &&
@@ -2530,6 +2680,32 @@ static int fg_bp_params_config(struct fg_chip *chip)
 	}
 
 	return rc;
+}
+
+static bool has_profile_revision_changed(struct fg_chip *chip)
+{
+	u8 val;
+	int rc = 0;
+
+	if (!chip->bp.profile_revision)
+		return false;
+
+	rc = fg_sram_read(chip, PROFILE_REVISION_WORD,
+			PROFILE_REVISION_OFFSET, &val, 1, FG_IMA_DEFAULT);
+
+	if (rc < 0) {
+		pr_err("FG: Unable to read profile revision, rc = %d\n", rc);
+		return true;
+	}
+
+	if (val != chip->bp.profile_revision) {
+		pr_err("FG: Profile Rev has changed from 0x%02x to 0x%02x\n",
+			val, chip->bp.profile_revision);
+		return true;
+	} else {
+		pr_debug("FG: Profile Revisions match\n");
+		return false;
+	}
 }
 
 #define PROFILE_LOAD_BIT	BIT(0)
@@ -2571,7 +2747,7 @@ static bool is_profile_load_required(struct fg_chip *chip)
 		}
 		profiles_same = memcmp(chip->batt_profile, buf,
 					PROFILE_COMP_LEN) == 0;
-		if (profiles_same) {
+		if (profiles_same && !has_profile_revision_changed(chip)) {
 			fg_dbg(chip, FG_STATUS, "Battery profile is same, not loading it\n");
 			return false;
 		}
@@ -2724,6 +2900,18 @@ static void profile_load_work(struct work_struct *work)
 	if (rc < 0) {
 		pr_err("failed to write profile integrity rc=%d\n", rc);
 		goto out;
+	}
+
+	/* Update Profile Revision */
+	if (chip->bp.profile_revision) {
+		rc = fg_sram_write(chip, PROFILE_REVISION_WORD,
+			PROFILE_REVISION_OFFSET, &chip->bp.profile_revision,
+			1, FG_IMA_DEFAULT);
+
+		if (rc < 0)
+			pr_err("Unable to update Profile revision to 0x%02x\n",
+				chip->bp.profile_revision);
+
 	}
 
 done:
@@ -3463,6 +3651,9 @@ static int fg_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CC_STEP_SEL:
 		pval->intval = chip->ttf.cc_step.sel;
 		break;
+	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
+		pval->intval = 0;
+		break;
 	default:
 		pr_err("unsupported property %d\n", psp);
 		rc = -EINVAL;
@@ -3473,6 +3664,100 @@ static int fg_psy_get_property(struct power_supply *psy,
 		return -ENODATA;
 
 	return 0;
+}
+
+#define BCL_RESET_RETRY_COUNT 4
+static int fg_bcl_reset(struct fg_chip *chip)
+{
+	int i, ret, rc = 0;
+	u8 val, peek_mux;
+	bool success = false;
+
+	/* Read initial value of peek mux1 */
+	rc = fg_read(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
+	if (rc < 0) {
+		pr_err("Error in writing peek mux1, rc=%d\n", rc);
+		return rc;
+	}
+
+	val = 0x83;
+	rc = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &val, 1);
+	if (rc < 0) {
+		pr_err("Error in writing peek mux1, rc=%d\n", rc);
+		return rc;
+	}
+
+	mutex_lock(&chip->sram_rw_lock);
+	for (i = 0; i < BCL_RESET_RETRY_COUNT; i++) {
+		rc = fg_dma_mem_req(chip, true);
+		if (rc < 0) {
+			pr_err("Error in locking memory, rc=%d\n", rc);
+			goto unlock;
+		}
+
+		rc = fg_read(chip, BATT_INFO_RDBACK(chip), &val, 1);
+		if (rc < 0) {
+			pr_err("Error in reading rdback, rc=%d\n", rc);
+			goto release_mem;
+		}
+
+		if (val & PEEK_MUX1_BIT) {
+			rc = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
+						BCL_RESET_BIT, BCL_RESET_BIT);
+			if (rc < 0) {
+				pr_err("Error in writing RST_CTRL0, rc=%d\n",
+						rc);
+				goto release_mem;
+			}
+
+			rc = fg_dma_mem_req(chip, false);
+			if (rc < 0)
+				pr_err("Error in unlocking memory, rc=%d\n",
+					 rc);
+
+			/* Delay of 2ms */
+			usleep_range(2000, 3000);
+			ret = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
+						BCL_RESET_BIT, 0);
+			if (ret < 0)
+				pr_err("Error in writing RST_CTRL0, rc=%d\n",
+						rc);
+			if (!rc && !ret)
+				success = true;
+
+			goto unlock;
+		} else {
+			rc = fg_dma_mem_req(chip, false);
+			if (rc < 0) {
+				pr_err("Error in unlocking memory, rc=%d\n",
+					 rc);
+				return rc;
+			}
+			success = false;
+			pr_err_ratelimited("PEEK_MUX1 not set retrying...\n");
+			msleep(1000);
+		}
+	}
+
+release_mem:
+	rc = fg_dma_mem_req(chip, false);
+	if (rc < 0)
+		pr_err("Error in unlocking memory, rc=%d\n", rc);
+
+unlock:
+	ret = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
+	if (ret < 0) {
+		pr_err("Error in writing peek mux1, rc=%d\n", rc);
+		mutex_unlock(&chip->sram_rw_lock);
+		return ret;
+	}
+
+	mutex_unlock(&chip->sram_rw_lock);
+
+	if (!success)
+		return -EAGAIN;
+	else
+		return rc;
 }
 
 static int fg_psy_set_property(struct power_supply *psy,
@@ -3519,6 +3804,13 @@ static int fg_psy_set_property(struct power_supply *psy,
 			pr_err("cc_step_sel is out of bounds [0, %d]\n",
 				pval->intval);
 			return -EINVAL;
+		}
+		break;
+	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
+		rc = fg_bcl_reset(chip);
+		if (rc < 0) {
+			pr_err("Error in resetting BCL clock, rc=%d\n", rc);
+			return rc;
 		}
 		break;
 	default:
@@ -3599,6 +3891,7 @@ static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
 	POWER_SUPPLY_PROP_CC_STEP,
 	POWER_SUPPLY_PROP_CC_STEP_SEL,
+	POWER_SUPPLY_PROP_FG_RESET_CLOCK,
 };
 
 static const struct power_supply_desc fg_psy_desc = {
@@ -3882,6 +4175,20 @@ static int fg_hw_init(struct fg_chip *chip)
 			return rc;
 		}
 	}
+
+	/*
+	*set ibat_cutoff from 500ma to 200ma
+	*val = ibat_cutoff / 0.00012207
+	*100mA: val = 0.1/0.00012207 = 0x333
+	*200mA: val = 0.2/0.00012207 = 0x666
+	*300mA: val = 0.3/0.00012207 = 0x999
+	*400mA: val = 0.4/0.00012207 = 0xCCC
+	*/
+	buf[0] = 0x66;
+	buf[1] = 0x6;
+	rc = fg_sram_write(chip, 4, 0, buf, 2, FG_IMA_DEFAULT);
+	if (rc < 0)
+		pr_err("Error in configuring Sram, rc=%d\n", rc);
 
 	return 0;
 }
@@ -4622,6 +4929,9 @@ static int fg_parse_dt(struct fg_chip *chip)
 
 	chip->dt.force_load_profile = of_property_read_bool(node,
 					"qcom,fg-force-load-profile");
+
+	chip->dt.cl_feedback = of_property_read_bool(node,
+					"qcom,cl-feedback");
 
 	rc = of_property_read_u32(node, "qcom,cl-start-capacity", &temp);
 	if (rc < 0)
