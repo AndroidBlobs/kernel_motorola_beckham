@@ -1,0 +1,203 @@
+/* Copyright (c) 2016, Motorola Mobility Inc. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+/*
+ * Assuming there will be NO more Messi boards built with V1 MSM parts
+ * beyond the small amount of early EVT1 boards, all future Messi dts
+ * should directly include this file instead of msm8998-nash-common.dtsi,
+ * though common dt changes could go to msm8998-nash-common.dtsi
+ */
+
+#include "msm8998-v2.dtsi"
+#include "msm8998-moto-common.dtsi"
+#include "msm8998-camera-sensor-mot-messi.dtsi"
+#include "dsi-panel-mot-smd-601-1080p-messie-cmd.dtsi"
+#include "dsi-panel-mot-tianma-601-1080p-messie-cmd.dtsi"
+#include "msm8998-messi-audio.dtsi"
+
+/ {
+	model = "Messi";
+	compatible = "qcom,msm8998-messi", "qcom,msm8998-moto",
+			"qcom,msm8998";
+
+	aliases {
+		/delete-property/ spi1;
+	};
+
+	firmware: firmware {
+		android {
+			compatible = "android,firmware";
+			fstab {
+				compatible = "android,fstab";
+				vendor {
+					compatible = "android,vendor";
+					dev = "/dev/block/platform/soc/1da4000.ufshc/by-name/vendor";
+					type = "ext4";
+					mnt_flags = "ro,barrier=1,discard";
+					fsmgr_flags = "wait,slotselect";
+					status = "ok";
+				};
+			};
+		};
+	};
+
+};
+
+&i2c_7 {
+	tps61280@75 {
+		compatible = "ti,tps61280";
+		reg = <0x75>;
+		ti,config = <0x0D>;
+		ti,vout-floor = <0x0D>;
+		ti,vout-roof = <0x19>;
+		ti,ilim = <0x0F>;
+	};
+
+	tmp108@49 {
+		compatible = "ti,tmp108";
+		reg = <0x49>;
+		interrupt-parent = <&tlmm>;
+		gpios = <&tlmm 1 0>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&tmp108_2_irq_default>;
+		label = "msm_tmp108";
+	};
+
+	cypress_capsensor@1D {
+		compatible = "cypress,sf3155";
+		label = "MotorolaCapSense";
+		reg = <0x1D>;
+		vdd-supply = <&pm8998_lvs2>;
+		vddio-supply = <&pm8998_lvs2>;
+		avdd-supply = <&pm8998_lvs2>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <63 0>;
+		silicon_id = <0x0BB11477>;
+		block_size = <64>;
+		num_of_blocks = <256>;
+		secure_bytes = <32>;
+		pinctrl-names = "default";
+		gpios = <&pmi8998_gpios 14 0x1>, /* RESET */
+		      <&tlmm 90 0>, /* programming SCLK */
+		      <&tlmm 94 0>, /* programming SDAT */
+		      <&tlmm 63 0>; /* sar int irq */
+		use-raw-gpio-rw = <1>;
+		gpio_base_addr = <0x03000004>;
+		gpio_base_size = <0x00e00000>;
+		gpio_clk_group = <0x00d00000>;
+		gpio_dat_group = <0x00d00000>;
+		cyttsp,sar-status-reg = <0x50>;
+		cyttsp,standby-reg = <0x51>;
+		cyttsp,bootloader-addr = <0x02>;
+		cyttsp,key-num = <4>;
+		cyttsp,key-codes = <4>;
+	};
+};
+
+&soc {
+	qcom,tz_gpio {
+		compatible = "qcom,tz_gpio";
+		tlmm-tz = <9>,
+			<58>,
+			<59>,
+			<60>,
+			<61>,
+			<123>;
+	};
+
+	alsa_to_h2w {
+	status = "disabled";
+	};
+
+	qcom,msm-thermal {
+		qcom,config-info = "messi";
+	};
+	/delete-node/ spi@c175000;
+};
+
+&tlmm {
+	/delete-node/ spi_1;  /* delete spi_1 node in tlmm */
+	/delete-node/ kungpow_default;
+
+	tmp108_2_irq {
+		tmp108_2_irq_default: default {
+			mux {
+				pins = "gpio1";
+				function = "gpio";
+			};
+			config {
+				pins = "gpio1";
+				drive-strength = <2>;
+				bias-pull-up;
+			};
+		};
+	};
+};
+
+&red_led {
+	linux,name = "charging";
+	/delete-property/ linux,default-trigger;
+	qcom,ramp-step-ms = <100>;
+	qcom,start-idx = <0>;
+	qcom,idx-len = <42>;
+	qcom,duty-pcts =
+		[00 05 0a 0f 14 19 1e 23 28 2d 32 37 3c 41 46 4b 50 55 5a 5f 64
+		64 5f 5a 55 50 4b 46 41 3c 37 32 2d 28 23 1e 19 14 0f 0a 05 00];
+	qcom,use-blink;
+};
+
+/delete-node/ &green_led;
+/delete-node/ &blue_led;
+
+&spmi_bus {
+	qcom,pm8998@0 {
+		qcom,power-on@800 {
+			qcom,pon_1 {
+				qcom,support-reset = <1>;
+				qcom,s1-timer = <6720>;
+				qcom,s2-timer = <2000>;
+				qcom,s2-type = <7>;
+			};
+		};
+	};
+};
+&mot_batterydata {
+	qcom,batt-id-range-pct = <15>;
+	df-serialnum = "SB18C20118";
+	#include "batterydata-js40-scud-pmi8998.dtsi"
+	#include "batterydata-js40-swd-pmi8998.dtsi"
+};
+
+&pmi8998_fg {
+	qcom,battery-data = <&mot_batterydata>;
+	qcom,fg-cutoff-voltage = <3200>;
+	qcom,fg-empty-voltage = <3000>;
+	qcom,fg-chg-term-current = <100>;
+	qcom,fg-sys-term-current = <(-200)>;
+	qcom,battery-thermal-coefficients = [c0 50 ff];
+};
+
+&pmi8998_charger {
+	pinctrl-0 = <&eb_vbus_conf>;
+	pinctrl-1 = <&eb_vbus_active>;
+	qcom,iterm-ma = <146>;
+	qcom,mmi-temp-zones = <0 4400 529 0>,
+				<10 4200 1323 529>,
+				<15 0 1323 1323>,
+				<45 4250 3000 2000>,
+				<60 4200 2000 0>;
+};
+
+&mdss_dsi0 {
+	qcom,dsi-pref-prim-pan = <&mot_smd_601_1080p_cmd_v0>;
+};
