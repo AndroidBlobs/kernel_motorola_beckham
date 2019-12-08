@@ -46,6 +46,7 @@
 #define FALSE       0x00
 #define SESSION_MAX 9
 #define ASM_MAX_CHANNELS 8
+
 enum {
 	ASM_TOPOLOGY_CAL = 0,
 	ASM_CUSTOM_TOP_CAL,
@@ -285,6 +286,11 @@ static ssize_t audio_output_latency_dbgfs_read(struct file *file,
 		pr_err("%s: out_buffer is null\n", __func__);
 		return 0;
 	}
+	if (count < OUT_BUFFER_SIZE) {
+		pr_err("%s: read size %d exceeds buf size %zd\n", __func__,
+						OUT_BUFFER_SIZE, count);
+		return 0;
+	}
 	snprintf(out_buffer, OUT_BUFFER_SIZE, "%ld,%ld,%ld,%ld,%ld,%ld,",\
 		out_cold_tv.tv_sec, out_cold_tv.tv_usec, out_warm_tv.tv_sec,\
 		out_warm_tv.tv_usec, out_cont_tv.tv_sec, out_cont_tv.tv_usec);
@@ -336,6 +342,11 @@ static ssize_t audio_input_latency_dbgfs_read(struct file *file,
 {
 	if (in_buffer == NULL) {
 		pr_err("%s: in_buffer is null\n", __func__);
+		return 0;
+	}
+	if (count < IN_BUFFER_SIZE) {
+		pr_err("%s: read size %d exceeds buf size %zd\n", __func__,
+						IN_BUFFER_SIZE, count);
 		return 0;
 	}
 	snprintf(in_buffer, IN_BUFFER_SIZE, "%ld,%ld,",\
@@ -1044,7 +1055,7 @@ int q6asm_audio_client_buf_free_contiguous(unsigned int dir,
 			&port->buf[0].phys,
 			port->buf[0].client,
 			port->buf[0].handle);
-		if (!rc || atomic_read(&ac->reset))
+		if (!rc && cnt >= 0)
 			msm_audio_ion_free(port->buf[0].client,
 					   port->buf[0].handle);
 		port->buf[0].client = NULL;
@@ -1060,7 +1071,7 @@ int q6asm_audio_client_buf_free_contiguous(unsigned int dir,
 	kfree(port->buf);
 	port->buf = NULL;
 	mutex_unlock(&ac->cmd_lock);
-	return 0;
+	return rc;
 }
 
 void q6asm_audio_client_free(struct audio_client *ac)
@@ -1158,7 +1169,9 @@ int q6asm_send_stream_cmd(struct audio_client *ac,
 {
 	char *asm_params = NULL;
 	struct apr_hdr hdr;
-	int sz, rc;
+	int rc;
+	uint32_t sz = 0;
+	uint64_t actual_sz = 0;
 
 	if (!data || !ac) {
 		pr_err("%s: %s is NULL\n", __func__,
@@ -1175,7 +1188,15 @@ int q6asm_send_stream_cmd(struct audio_client *ac,
 		goto done;
 	}
 
-	sz = sizeof(struct apr_hdr) + data->payload_len;
+	actual_sz = sizeof(struct apr_hdr) + data->payload_len;
+	if (actual_sz > U32_MAX) {
+		pr_err("%s: payload size 0x%X exceeds limit\n",
+				__func__, data->payload_len);
+		rc = -EINVAL;
+		goto done;
+	}
+
+	sz = (uint32_t)actual_sz;
 	asm_params = kzalloc(sz, GFP_KERNEL);
 	if (!asm_params) {
 		rc = -ENOMEM;
@@ -1457,6 +1478,12 @@ int q6asm_audio_client_buf_alloc_contiguous(unsigned int dir,
 		pr_err("%s: buffer already allocated\n", __func__);
 		return 0;
 	}
+
+	if (bufcnt == 0) {
+		pr_err("%s: invalid buffer count\n", __func__);
+		return -EINVAL;
+	}
+
 	mutex_lock(&ac->cmd_lock);
 	buf = kzalloc(((sizeof(struct audio_buffer))*bufcnt),
 			GFP_KERNEL);
