@@ -233,6 +233,7 @@
 
 #define QPNP_WLED_AVDD_MV_TO_REG(val) \
 		((val - QPNP_WLED_AVDD_MIN_MV) / QPNP_WLED_AVDD_STEP_MV)
+#define SDM660l_DISABLE_OVP_CNT 10
 
 /* output feedback mode */
 enum qpnp_wled_fdbk_op {
@@ -404,6 +405,8 @@ struct qpnp_wled {
 	bool			auto_calib_enabled;
 	bool			auto_calib_done;
 	ktime_t			start_ovp_fault_time;
+	bool			sdm660l_ovp_disable;
+	u32			ovp_cnt;
 };
 
 /* helper to read a pmic register */
@@ -1092,7 +1095,7 @@ static int qpnp_wled_set_disp(struct qpnp_wled *wled, u16 base_addr)
 	return 0;
 }
 
-#define AUTO_CALIB_BRIGHTNESS		16
+#define AUTO_CALIB_BRIGHTNESS		200
 static int wled_auto_calibrate(struct qpnp_wled *wled)
 {
 	int rc = 0, i;
@@ -1130,6 +1133,17 @@ static int wled_auto_calibrate(struct qpnp_wled *wled)
 		goto failed_calib;
 	}
 
+	if (wled->en_cabc) {
+		for (i = 0; i < wled->max_strings; i++) {
+			reg = 0;
+			rc = qpnp_wled_masked_write_reg(wled,
+				QPNP_WLED_CABC_REG(wled->sink_base, i),
+				QPNP_WLED_CABC_MASK, reg);
+			if (rc < 0)
+				goto failed_calib;
+		}
+	}
+
 	/* disable all sinks */
 	rc = qpnp_wled_write_reg(wled,
 		 QPNP_WLED_CURR_SINK_REG(wled->sink_base), 0);
@@ -1137,21 +1151,6 @@ static int wled_auto_calibrate(struct qpnp_wled *wled)
 		pr_err("Failed to disable all sinks rc=%d\n", rc);
 		goto failed_calib;
 	}
-
-	rc = qpnp_wled_masked_write_reg(wled,
-		QPNP_WLED_MODULE_EN_REG(wled->ctrl_base),
-		QPNP_WLED_MODULE_EN_MASK,
-		QPNP_WLED_MODULE_EN_MASK);
-	if (rc < 0) {
-		pr_err("Failed to enable WLED module rc=%d\n", rc);
-		goto failed_calib;
-	}
-	/*
-	 * Delay for the WLED soft-start, check the OVP status
-	 * only after soft-start is complete
-	 */
-	usleep_range(QPNP_WLED_SOFT_START_DLY_US,
-			QPNP_WLED_SOFT_START_DLY_US + 1000);
 
 	/* iterate through the strings one by one */
 	for (i = 0; i < wled->max_strings; i++) {
@@ -1176,6 +1175,15 @@ static int wled_auto_calibrate(struct qpnp_wled *wled)
 			goto failed_calib;
 		}
 
+		/* Enable the module */
+		rc = qpnp_wled_masked_write_reg(wled,
+			QPNP_WLED_MODULE_EN_REG(wled->ctrl_base),
+			QPNP_WLED_MODULE_EN_MASK, QPNP_WLED_MODULE_EN_MASK);
+		if (rc < 0) {
+			pr_err("Failed to enable WLED module rc=%d\n", rc);
+			goto failed_calib;
+		}
+
 		/* delay for WLED soft-start */
 		usleep_range(QPNP_WLED_SOFT_START_DLY_US,
 				QPNP_WLED_SOFT_START_DLY_US + 1000);
@@ -1192,6 +1200,15 @@ static int wled_auto_calibrate(struct qpnp_wled *wled)
 						i + 1);
 		else
 			sink_valid |= sink_test;
+
+		/* Disable the module */
+		rc = qpnp_wled_masked_write_reg(wled,
+			QPNP_WLED_MODULE_EN_REG(wled->ctrl_base),
+			QPNP_WLED_MODULE_EN_MASK, 0);
+		if (rc < 0) {
+			pr_err("Failed to disable WLED module rc=%d\n", rc);
+			goto failed_calib;
+		}
 	}
 
 	if (sink_valid == sink_config) {
@@ -1208,14 +1225,6 @@ static int wled_auto_calibrate(struct qpnp_wled *wled)
 		goto failed_calib;
 	}
 
-	rc = qpnp_wled_masked_write_reg(wled,
-			QPNP_WLED_MODULE_EN_REG(wled->ctrl_base),
-			QPNP_WLED_MODULE_EN_MASK, 0);
-	if (rc < 0) {
-		pr_err("Failed to disable WLED module rc=%d\n", rc);
-		goto failed_calib;
-	}
-
 	/* write the new sink configuration */
 	rc = qpnp_wled_write_reg(wled,
 			QPNP_WLED_CURR_SINK_REG(wled->sink_base), sink_config);
@@ -1226,6 +1235,15 @@ static int wled_auto_calibrate(struct qpnp_wled *wled)
 
 	/* MODULATOR_EN setting for valid sinks */
 	for (i = 0; i < wled->max_strings; i++) {
+		if (wled->en_cabc) {
+			reg = 1 << QPNP_WLED_CABC_SHIFT;
+			rc = qpnp_wled_masked_write_reg(wled,
+				QPNP_WLED_CABC_REG(wled->sink_base, i),
+				QPNP_WLED_CABC_MASK, reg);
+			if (rc < 0)
+				goto failed_calib;
+		}
+
 		if (sink_config & (1 << (QPNP_WLED_CURR_SINK_SHIFT + i)))
 			reg = (QPNP_WLED_MOD_EN << QPNP_WLED_MOD_EN_SHFT);
 		else
@@ -1351,6 +1369,15 @@ static irqreturn_t qpnp_wled_ovp_irq_handler(int irq, void *_wled)
 				}
 				wled->auto_calib_done = true;
 			}
+		}
+	}
+
+	if (wled->sdm660l_ovp_disable) {
+		wled->ovp_cnt++;
+		if (wled->ovp_cnt > SDM660l_DISABLE_OVP_CNT) {
+			pr_err("SDM660L WLED OVP disable\n");
+			disable_irq(wled->ovp_irq);
+			wled->ovp_irq_disabled = true;
 		}
 	}
 
@@ -2355,6 +2382,9 @@ static int qpnp_wled_parse_dt(struct qpnp_wled *wled)
 
 	wled->auto_calib_enabled = of_property_read_bool(pdev->dev.of_node,
 					"qcom,auto-calibration-enable");
+	wled->sdm660l_ovp_disable = of_property_read_bool(pdev->dev.of_node,
+					"en-sdm660l-ovp-disable");
+
 	return 0;
 }
 
